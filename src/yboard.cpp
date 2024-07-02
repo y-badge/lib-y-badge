@@ -10,9 +10,26 @@ void YBoardV3::setup() {
     setup_leds();
     setup_switches();
     setup_buttons();
-    setup_speaker();
-    setup_accelerometer();
-    setup_temperature();
+
+    if (setup_sd_card()) {
+        Serial.println("SD Card Setup: Success");
+    }
+
+    if (setup_speaker()) {
+        Serial.println("Speaker Setup: Success");
+    }
+
+    if (setup_mic()) {
+        Serial.println("Mic Setup: Success");
+    }
+
+    if (setup_accelerometer()) {
+        Serial.println("Accelerometer Setup: Success");
+    }
+
+    if (setup_temperature()) {
+        Serial.println("Temperature Sensor Setup: Success");
+    }
 }
 
 ////////////////////////////// LEDs ///////////////////////////////
@@ -83,26 +100,24 @@ int YBoardV3::get_knob() {
 
 ////////////////////////////// Speaker/Tones //////////////////////////////////
 bool YBoardV3::setup_speaker() {
-    // Set microSD Card CS as OUTPUT and set HIGH
-    pinMode(sd_cs_pin, OUTPUT);
-    digitalWrite(sd_cs_pin, HIGH);
 
-    // Initialize SPI bus for microSD Card
-    SPI.begin(spi_sck_pin, spi_miso_pin, spi_mosi_pin);
-
-    YAudio::setup();
+    if (!YAudio::setup_speaker()) {
+        Serial.println("ERROR: Speaker setup failed.");
+        return false;
+    }
 
     // Set Volume
     YAudio::set_wave_volume(5);
 
-    // Start microSD Card
-    if (!SD.begin(sd_cs_pin)) {
-        Serial.println("Error accessing microSD card!");
-        sd_card_present = false;
+    return true;
+}
+
+bool YBoardV3::setup_mic() {
+    if (!YAudio::setup_mic()) {
+        Serial.println("ERROR: Mic setup failed.");
         return false;
     }
 
-    sd_card_present = true;
     return true;
 }
 
@@ -156,9 +171,31 @@ bool YBoardV3::play_notes(const std::string &notes) {
 
 bool YBoardV3::play_notes_background(const std::string &notes) { return YAudio::add_notes(notes); }
 
-void YBoardV3::stop_audio() { YAudio::stop(); }
+void YBoardV3::stop_audio() { YAudio::stop_speaker(); }
 
 bool YBoardV3::is_audio_playing() { return YAudio::is_playing(); }
+
+////////////////////////////// Microphone ////////////////////////////////////////
+bool YBoardV3::start_recording(const std::string &filename) {
+    // Prepend filename with a / if it doesn't have one
+    std::string _filename = filename;
+    if (_filename[0] != '/') {
+        _filename.insert(0, "/");
+    }
+
+    if (!sd_card_present) {
+        Serial.println("ERROR: SD Card not present.");
+        return false;
+    }
+
+    return YAudio::start_recording(filename);
+}
+
+void YBoardV3::stop_recording() { YAudio::stop_recording(); }
+
+bool YBoardV3::is_recording() { return YAudio::is_recording(); }
+
+void YBoardV3::set_recording_volume(uint8_t volume) { YAudio::set_recording_volume(volume); }
 
 ////////////////////////////// Accelerometer /////////////////////////////////////
 bool YBoardV3::setup_accelerometer() {
@@ -209,4 +246,24 @@ temperature_data YBoardV3::get_temperature() {
     data.humidity = h.relative_humidity;
 
     return data;
+}
+
+bool YBoardV3::setup_sd_card() {
+    // Set microSD Card CS as OUTPUT and set HIGH
+    pinMode(sd_cs_pin, OUTPUT);
+    digitalWrite(sd_cs_pin, HIGH);
+
+    // Initialize SPI bus for microSD Card
+    SPI.begin(spi_sck_pin, spi_miso_pin, spi_mosi_pin);
+
+    // Start microSD Card
+    if (!SD.begin(sd_cs_pin)) {
+        Serial.println("Error accessing microSD card!");
+        sd_card_present = false;
+        return false;
+    }
+
+    sd_card_present = true;
+
+    return true;
 }

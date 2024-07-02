@@ -7,13 +7,46 @@
 
 namespace YAudio {
 
+static const int MIC_SAMPLE_RATE = 16000;
+static const int MIC_ORIGINAL_SAMPLE_BITS = 32;
+static const int MIC_CONVERTED_SAMPLE_BITS = 16;
+static const int MIC_READ_BUF_SIZE = 2048;
+static const int MIC_NUM_CHANNELS = 1;
+static const i2s_port_t MIC_I2S_PORT = I2S_NUM_1;
+
+// Wave header as struct
+typedef struct {
+    char riff_tag[4];
+    uint32_t riff_length;
+    char wave_tag[4];
+    char fmt_tag[4];
+    uint32_t fmt_length;
+    uint16_t audio_format;
+    uint16_t num_channels;
+    uint32_t sample_rate;
+    uint32_t byte_rate;
+    uint16_t block_align;
+    uint16_t bits_per_sample;
+    char data_tag[4];
+    uint32_t data_length;
+} wave_header_t;
+
+uint32_t i2s_read_buff[MIC_READ_BUF_SIZE];
+uint16_t file_write_buff[MIC_READ_BUF_SIZE];
+
+static bool recording_audio = false;
+static bool done_recording_audio = true;
+static File speaker_recording_file;
+
+static int recording_volume = 5;
+
 ///////////////////////////////// Configuration Constants //////////////////////
-i2s_port_t I2S_PORT = I2S_NUM_0;
+i2s_port_t SPEAKER_I2S_PORT = I2S_NUM_0;
 
 // The number of bits per sample.
-static const int BITS_PER_SAMPLE = 16;
-static const int BYTES_PER_SAMPLE = BITS_PER_SAMPLE / 8;
-static const int SAMPLE_RATE = 16000; // sample rate in Hz
+static const int SPEAKER_BITS_PER_SAMPLE = 16;
+static const int SPEAKER_BYTES_PER_SAMPLE = SPEAKER_BITS_PER_SAMPLE / 8;
+static const int SPEAKER_SAMPLE_RATE = 16000; // sample rate in Hz
 static const int MAX_NOTES_IN_BUFFER = 4000;
 
 // The number of frames of valid PCM audio data in the audio buffer. This will be incremented when
@@ -63,20 +96,173 @@ static float next_note_duration_s;
 static fs::File file;
 static int volume_wave;
 
+static QueueHandle_t i2s_event_queue;
+int I2S_Q_LEN = 10;
+bool TXdoneEvent = false;
+
 //////////////////////////// Private Function Prototypes ///////////////////////
 // Local private functions
 static void generate_sine_wave(double frequency, int num_samples, double amplitude);
 static void write_next_note_to_audio_buf();
 static void parse_next_note();
 static void set_note_defaults();
+static void reset_audio_buf();
 static void start_i2s();
+static void I2Sout(void *params);
+static void create_wave_header(wave_header_t *header, int data_length);
+static void convert_samples(uint16_t *dest, const uint32_t *src, int num_samples);
 
 ////////////////////////////// Public Functions ///////////////////////////////
+bool setup_speaker() {
+    esp_err_t err;
+
+    // Initialize global variables
+    reset_audio_buf();
+    set_note_defaults();
+    i2s_running = false;
+    notes_running = false;
+    wave_running = false;
+    volume_wave = 5;
+
+    const i2s_config_t i2s_config_speaker = {
+        .mode = i2s_mode_t(I2S_MODE_MASTER | I2S_MODE_TX), // Receive, not transfer
+        .sample_rate = SPEAKER_SAMPLE_RATE,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT, // could only get it to work with 32bits
+        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,  // use left channel
+        .communication_format = i2s_comm_format_t(I2S_COMM_FORMAT_STAND_I2S),
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1, // Interrupt level 1
+
+        .dma_buf_count = 2,
+        .dma_buf_len = 1024,
+        .use_apll = 0};
+
+    const i2s_pin_config_t pin_config_speaker = {
+        .bck_io_num = 21, .ws_io_num = 47, .data_out_num = 14, .data_in_num = I2S_PIN_NO_CHANGE};
+
+    err = i2s_driver_install(SPEAKER_I2S_PORT, &i2s_config_speaker, I2S_Q_LEN, &i2s_event_queue);
+    if (err != ESP_OK) {
+        Serial.printf("Failed installing I2S driver: %d\n", err);
+        return false;
+    }
+
+    xTaskCreate(I2Sout, "I2Sout", 20000, NULL, 1, NULL);
+
+    err = i2s_set_pin(SPEAKER_I2S_PORT, &pin_config_speaker);
+    if (err != ESP_OK) {
+        Serial.printf("Failed setting I2S pin configuration: %d\n", err);
+        return false;
+    }
+
+    i2s_running = true;
+
+    Serial.println("I2S setup complete and running for speaker");
+    return true;
+}
+
+bool setup_mic() {
+    esp_err_t err;
+
+    const i2s_config_t i2s_config_mic = {
+
+        .mode = i2s_mode_t(I2S_MODE_MASTER | I2S_MODE_RX), // Receive, not transfer
+        .sample_rate = MIC_SAMPLE_RATE,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT, // could only get it to work with 32bits
+        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,  // use left channel
+        .communication_format = i2s_comm_format_t(I2S_COMM_FORMAT_STAND_I2S),
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1, // Interrupt level 1
+
+        .dma_buf_count = 2,
+        .dma_buf_len = 1024,
+        .use_apll = 1};
+
+    const i2s_pin_config_t pin_config_mic = {
+        .bck_io_num = 42, .ws_io_num = 41, .data_out_num = I2S_PIN_NO_CHANGE, .data_in_num = 40};
+
+    err = i2s_driver_install(MIC_I2S_PORT, &i2s_config_mic, 0, NULL);
+    if (err != ESP_OK) {
+        Serial.printf("Failed installing driver: %d\n", err);
+        return false;
+    }
+
+    REG_SET_BIT(I2S_RX_TIMING_REG(MIC_I2S_PORT), BIT(0));
+    REG_SET_BIT(I2S_RX_CONF1_REG(MIC_I2S_PORT), I2S_RX_MSB_SHIFT);
+
+    err = i2s_set_pin(MIC_I2S_PORT, &pin_config_mic);
+    if (err != ESP_OK) {
+        Serial.printf("Failed setting pin: %d\n", err);
+        return false;
+    }
+
+    Serial.println("I2S setup complete for mic");
+    return true;
+}
+
+void set_wave_volume(uint8_t new_volume) { volume_wave = new_volume > 10 ? 10 : new_volume; }
+
+void stop_speaker() {
+    if (i2s_running) {
+        i2s_stop(SPEAKER_I2S_PORT);
+        i2s_running = false;
+    }
+    if (wave_running) {
+        file.close();
+        wave_running = false;
+    }
+    if (notes_running) {
+        notes_running = false;
+        notes = "";
+    }
+    i2s_zero_dma_buffer(SPEAKER_I2S_PORT);
+    reset_audio_buf();
+}
+
+bool is_playing() { return i2s_running; }
+
+bool play_sound_file(const std::string &filename) {
+    // Whether notes or wave is running, stop it
+    stop_speaker();
+
+    // Read the WAVE file header
+    file = SD.open(filename.c_str());
+    wave_header_t header;
+    int bytes_read = file.read((uint8_t *)&header, sizeof(header));
+    if (bytes_read != 44) {
+        Serial.println("Error reading WAVE file header");
+        file.close();
+        return false;
+    }
+
+    if (header.num_channels != 1) {
+        Serial.printf("This file has %f channels. Only mono WAVE files are supported.",
+                      header.num_channels);
+        file.close();
+        return false;
+    }
+
+    if (header.sample_rate != SPEAKER_SAMPLE_RATE) {
+        Serial.printf("This file has a sample rate of %d. Only %d Hz sample rate is supported\n",
+                      header.sample_rate, SPEAKER_SAMPLE_RATE);
+        file.close();
+        return false;
+    }
+
+    if (header.bits_per_sample != SPEAKER_BITS_PER_SAMPLE) {
+        Serial.printf("This file has %d bits per sample. Only %d bits per sample is supported\n",
+                      header.bits_per_sample, SPEAKER_BITS_PER_SAMPLE);
+        file.close();
+        return false;
+    }
+
+    start_i2s();
+    wave_running = true;
+    return true;
+}
+
 bool add_notes(const std::string &new_notes) {
     // If WAVE is running, then stop it and reset the audio buffer.
     // Otherwise if notes are running, it's fine to let them keep running.
     if (wave_running) {
-        stop();
+        stop_speaker();
     }
 
     if ((notes.length() + new_notes.length()) > MAX_NOTES_IN_BUFFER) {
@@ -101,18 +287,110 @@ bool add_notes(const std::string &new_notes) {
     return true;
 }
 
+bool start_recording(const std::string &filename) {
+    if (recording_audio) {
+        Serial.println("Already recording audio");
+        return false;
+    }
+
+    speaker_recording_file = SD.open(filename.c_str(), FILE_WRITE);
+    if (!speaker_recording_file) {
+        Serial.println("Error opening/creating file for recording.");
+        return false;
+    }
+
+    // Clear out the buffer before we start recording
+    size_t bytes_read;
+    i2s_read(MIC_I2S_PORT, i2s_read_buff, MIC_READ_BUF_SIZE, &bytes_read, portMAX_DELAY);
+    i2s_read(MIC_I2S_PORT, i2s_read_buff, MIC_READ_BUF_SIZE, &bytes_read, portMAX_DELAY);
+
+    // Set up initial state
+    recording_audio = true;
+    done_recording_audio = false;
+
+    // Create the task to actually do the recording
+    xTaskCreate(
+        [](void *arg) {
+            int total_bytes_read = 0;
+            size_t bytes_read = 0;
+            wave_header_t header;
+
+            // Skip over the header for now
+            speaker_recording_file.seek(sizeof(header));
+
+            Serial.println(" *** Recording Start *** ");
+            while (recording_audio) {
+                // Read in an audio sample
+                if (i2s_read(MIC_I2S_PORT, i2s_read_buff, MIC_READ_BUF_SIZE, &bytes_read,
+                             portMAX_DELAY) != ESP_OK) {
+                    Serial.println("Failed to read data from I2S");
+                    break;
+                }
+
+                // Convert the 32-bit samples to 16-bit samples
+                convert_samples(file_write_buff, i2s_read_buff, bytes_read / 4);
+                int bytes_to_write = bytes_read / 2;
+
+                // Write it to the file
+                if (speaker_recording_file.write((uint8_t *)file_write_buff, bytes_to_write) !=
+                    bytes_to_write) {
+                    Serial.println("Failed to write data to file");
+                    break;
+                }
+
+                total_bytes_read += bytes_read;
+                Serial.println("Recording audio...");
+            }
+
+            // Fill in the header
+            create_wave_header(&header, total_bytes_read);
+
+            // Go back to the beginning of the file so we can write the header
+            speaker_recording_file.seek(0);
+
+            // Write the header to the disk
+            speaker_recording_file.write((uint8_t *)&header, sizeof(header));
+            speaker_recording_file.close();
+
+            // Indicate to the main task that we are done
+            done_recording_audio = true;
+
+            // This task is done so delete itself
+            vTaskDelete(NULL);
+        },
+        "recording_audio", 4096, NULL, 1, NULL);
+
+    return true;
+}
+
+void stop_recording() {
+    // Notify the other task it should be done
+    recording_audio = false;
+
+    // Wait for other task to finish
+    while (!done_recording_audio) {
+        delay(10);
+    }
+}
+
+bool is_recording() { return recording_audio; }
+
+void set_recording_volume(uint8_t new_volume) {
+    recording_volume = new_volume > 12 ? 12 : new_volume;
+}
+
 ////////////////////////////// Private Functions ///////////////////////////////
 
 void start_i2s() {
     if (i2s_running) {
         return;
     }
-    i2s_start(I2S_PORT);
+    i2s_start(SPEAKER_I2S_PORT);
     i2s_running = true;
 }
 
 static void generate_silence(float duration_s) {
-    int num_samples = duration_s * SAMPLE_RATE;
+    int num_samples = duration_s * SPEAKER_SAMPLE_RATE;
 
     for (int i = 0; i < num_samples; i++) {
         int idx = audio_buf_empty_idx ^ 1;
@@ -130,7 +408,7 @@ static void generate_silence(float duration_s) {
 static void generate_sine_wave(float duration_s, double frequency, double amplitude) {
     const float FADE_IN_FRAC = 0.02;
     const float FADE_OUT_FRAC = 0.02;
-    int num_samples = duration_s * SAMPLE_RATE;
+    int num_samples = duration_s * SPEAKER_SAMPLE_RATE;
 
     for (int i = 0; i < num_samples; i++) {
         int16_t val;
@@ -145,7 +423,7 @@ static void generate_sine_wave(float duration_s, double frequency, double amplit
         } else {
             _amp = amplitude;
         }
-        val = _amp * sin(2 * 3.14 * frequency * i / SAMPLE_RATE);
+        val = _amp * sin(2 * 3.14 * frequency * i / SPEAKER_SAMPLE_RATE);
 
         int idx = audio_buf_empty_idx ^ 1;
         audio_buf[idx] = val;
@@ -160,10 +438,6 @@ static void generate_sine_wave(float duration_s, double frequency, double amplit
         }
     }
 }
-
-static QueueHandle_t i2s_event_queue;
-int I2S_Q_LEN = 10;
-bool TXdoneEvent = false;
 
 void I2Sout(void *params) {
     int retv;
@@ -188,8 +462,8 @@ void I2Sout(void *params) {
         if (TXdoneEvent) {
             if (audio_buf_num_populated_frames >= 0) {
                 size_t bytes_written;
-                i2s_write(I2S_PORT, &audio_buf[audio_buf_frame_idx_to_send * FRAME_SIZE],
-                          FRAME_SIZE * BYTES_PER_SAMPLE, &bytes_written, portMAX_DELAY);
+                i2s_write(SPEAKER_I2S_PORT, &audio_buf[audio_buf_frame_idx_to_send * FRAME_SIZE],
+                          FRAME_SIZE * SPEAKER_BYTES_PER_SAMPLE, &bytes_written, portMAX_DELAY);
 
                 audio_buf_frame_idx_to_send =
                     (audio_buf_frame_idx_to_send + 1) % AUDIO_BUF_NUM_FRAMES;
@@ -214,56 +488,33 @@ void reset_audio_buf() {
     notes = "";
 }
 
-void setup() {
-    // Initialize global variables
-    reset_audio_buf();
-    set_note_defaults();
-    i2s_running = false;
-    notes_running = false;
-    wave_running = false;
-    volume_wave = 5;
+void create_wave_header(wave_header_t *header, int data_length) {
+    memcpy(header->riff_tag, "RIFF", 4);
+    header->riff_length = data_length + sizeof(header) - 8; // TODO: why is there 8?
+    memcpy(header->wave_tag, "WAVE", 4);
+    memcpy(header->fmt_tag, "fmt ", 4);
+    header->fmt_length = 16;
+    header->audio_format = 1;
+    header->num_channels = MIC_NUM_CHANNELS;
+    header->sample_rate = MIC_SAMPLE_RATE;
+    header->byte_rate = MIC_SAMPLE_RATE * (MIC_CONVERTED_SAMPLE_BITS / 8) * MIC_NUM_CHANNELS;
+    header->block_align = 4;
+    header->bits_per_sample = MIC_CONVERTED_SAMPLE_BITS;
+    memcpy(header->data_tag, "data", 4);
+    header->data_length = data_length;
+}
 
-    const i2s_config_t i2s_config = {
-        .mode = i2s_mode_t(I2S_MODE_MASTER | I2S_MODE_TX), // Receive, not transfer
-        .sample_rate = SAMPLE_RATE,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT, // could only get it to work with 32bits
-        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,  // use left channel
-        .communication_format = i2s_comm_format_t(I2S_COMM_FORMAT_STAND_I2S),
-        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1, // Interrupt level 1
-
-        .dma_buf_count = 2,
-        .dma_buf_len = 1024,
-        .use_apll = 0};
-
-    const i2s_pin_config_t pin_config = {
-        .bck_io_num = 21, .ws_io_num = 47, .data_out_num = 14, .data_in_num = I2S_PIN_NO_CHANGE};
-
-    int err;
-
-    err = i2s_driver_install(I2S_PORT, &i2s_config, I2S_Q_LEN, &i2s_event_queue);
-    if (err != ESP_OK) {
-        Serial.printf("Failed installing I2S driver: %d\n", err);
-        return;
+void convert_samples(uint16_t *dest, const uint32_t *src, int num_samples) {
+    for (int i = 0; i < num_samples; i++) {
+        dest[i] = (src[i] >> 16) * recording_volume;
     }
-
-    TaskHandle_t I2StaskHandle;
-    xTaskCreate(I2Sout, "I2Sout", 20000, NULL, 1, &I2StaskHandle);
-
-    err = i2s_set_pin(I2S_PORT, &pin_config);
-    if (err != ESP_OK) {
-        Serial.printf("Failed setting I2S pin configuration: %d\n", err);
-        return;
-    }
-
-    i2s_running = true;
-    // Serial.println("I2S setup complete and running");
 }
 
 void write_next_note_to_audio_buf() {
 
     // Check if we have enough space in the buffer to add the note
     int avail_space = (AUDIO_BUF_NUM_FRAMES - audio_buf_num_populated_frames - 1) * FRAME_SIZE;
-    int note_samples = next_note_duration_s * SAMPLE_RATE;
+    int note_samples = next_note_duration_s * SPEAKER_SAMPLE_RATE;
 
     if (avail_space > note_samples) {
 
@@ -477,11 +728,11 @@ void loop() {
         // Check if we should stop playing
         if (notes.length() == 0 && !next_note_parsed && audio_buf_num_populated_frames == 0 &&
             i2s_running) {
-            stop();
+            stop_speaker();
         }
     } else if (wave_running) {
         if (file.available() && audio_buf_num_populated_frames < WAVE_FRAMES_TO_BUFFER) {
-            int bytes_to_read = FRAME_SIZE * BYTES_PER_SAMPLE;
+            int bytes_to_read = FRAME_SIZE * SPEAKER_BYTES_PER_SAMPLE;
 
             size_t bytes_read =
                 file.read((uint8_t *)&audio_buf[audio_buf_empty_idx], bytes_to_read);
@@ -501,65 +752,9 @@ void loop() {
                 // Serial.printf("Frame filled. # populated: %d\n", audio_buf_num_populated_frames);
             }
         } else if (audio_buf_num_populated_frames <= 0) {
-            stop();
+            stop_speaker();
         }
     }
-}
-
-void set_wave_volume(uint8_t new_volume) { volume_wave = new_volume > 10 ? 10 : new_volume; }
-
-void stop() {
-    if (i2s_running) {
-        i2s_stop(I2S_PORT);
-        i2s_running = false;
-    }
-    if (wave_running) {
-        file.close();
-        wave_running = false;
-    }
-    if (notes_running) {
-        notes_running = false;
-        notes = "";
-    }
-    i2s_zero_dma_buffer(I2S_PORT);
-    reset_audio_buf();
-}
-
-bool is_playing() { return i2s_running; }
-
-bool play_sound_file(const std::string &filename) {
-    // Whether notes or wave is running, stop it
-    stop();
-
-    // Read the WAVE file header
-    file = SD.open(filename.c_str());
-    uint8_t header[44];
-    int bytes_read = file.read(header, 44);
-    if (bytes_read != 44) {
-        Serial.println("Error reading WAVE file header");
-        file.close();
-        return false;
-    }
-
-    int num_channels = *(uint16_t *)&header[22];
-    if (num_channels != 1) {
-        Serial.printf("This file has %f channels. Only mono WAVE files are supported.",
-                      num_channels);
-        file.close();
-        return false;
-    }
-
-    uint32_t sample_rate = *(uint32_t *)&header[24];
-    if (sample_rate != SAMPLE_RATE) {
-        Serial.printf("This file has a sample rate of %d. Only %d Hz sample rate is supported\n",
-                      sample_rate, SAMPLE_RATE);
-        file.close();
-        return false;
-    }
-
-    start_i2s();
-    wave_running = true;
-    return true;
 }
 
 }; // namespace YAudio

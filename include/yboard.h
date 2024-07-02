@@ -166,6 +166,32 @@ class YBoardV3 {
      */
     bool is_audio_playing();
 
+    ////////////////////////////// Microphone ////////////////////////////////////////
+    /*
+     *  This function starts recording audio from the microphone. The filename is a
+     * string representing the name of the file to save the recording to. The return
+     * type is a boolean value (true or false). True corresponds to the recording
+     * starting successfully, and false corresponds to an error starting the recording.
+     * The recording will continue until stop_recording is called.
+     */
+    bool start_recording(const std::string &filename);
+
+    /*
+     *  This function stops recording audio from the microphone.
+     */
+    void stop_recording();
+
+    /*
+     *  This function returns whether the microphone is currently recording.
+     */
+    bool is_recording();
+
+    /*
+     *  This function sets the volume of the microphone when recording. The volume is
+     * an integer between 0 and 12. A volume of 0 is off, and a volume of 12 is full volume.
+     */
+    void set_recording_volume(uint8_t volume);
+
     ///////////////////////////// Accelerometer ////////////////////////////////////
     /*
      *  This function returns whether accelerometer data is available.
@@ -232,8 +258,10 @@ class YBoardV3 {
     void setup_switches();
     void setup_buttons();
     bool setup_speaker();
+    bool setup_mic();
     bool setup_accelerometer();
     bool setup_temperature();
+    bool setup_sd_card();
 };
 
 extern YBoardV3 Yboard;
